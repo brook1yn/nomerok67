@@ -14,14 +14,21 @@ const {
   ROBLOX_CLIENT_SECRET,
   SESSION_SECRET = "dev-secret-change-me",
   GAME_SECRET,
-  PUBLIC_URL = "http://localhost:3000",
   GAME_URL = "https://www.roblox.com/games/",
 } = process.env;
 
 const ROLL_COST = Number(process.env.ROLL_COST || 500); // как в игре
 const ONLINE_WINDOW_SEC = 25; // игрок «в игре», если сервер присылал его баланс за последние N секунд
 const REDELIVER_SEC = 90; // номер «в пути» без ответа от игры дольше — отправляем ещё раз
-const REDIRECT_URI = PUBLIC_URL.replace(/\/$/, "") + "/auth/callback";
+// Адрес сайта: из PUBLIC_URL, а если не задан — берём из запроса (Render отдаёт https и свой домен)
+const PUBLIC_URL = String(process.env.PUBLIC_URL || "")
+  .trim()
+  .replace(/\/auth\/callback\/?$/, "")
+  .replace(/\/+$/, "");
+function redirectUri(req) {
+  const base = PUBLIC_URL || req.protocol + "://" + req.get("host");
+  return base + "/auth/callback";
+}
 
 if (!DATABASE_URL) {
   console.error("Нет DATABASE_URL");
@@ -83,7 +90,7 @@ app.use(
     keys: [SESSION_SECRET],
     maxAge: 30 * 24 * 3600 * 1000,
     sameSite: "lax",
-    secure: PUBLIC_URL.startsWith("https"),
+    secure: process.env.NODE_ENV === "production",
     httpOnly: true,
   })
 );
@@ -99,7 +106,7 @@ app.get("/auth/login", (req, res) => {
   req.session.oauth = { verifier, state };
   const q = new URLSearchParams({
     client_id: ROBLOX_CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
+    redirect_uri: redirectUri(req),
     scope: "openid profile",
     response_type: "code",
     state,
@@ -107,6 +114,13 @@ app.get("/auth/login", (req, res) => {
     code_challenge_method: "S256",
   });
   res.redirect("https://apis.roblox.com/oauth/v1/authorize?" + q.toString());
+});
+
+// Подсказка: какой Redirect URL вписать в OAuth-приложение Roblox
+app.get("/auth/where", (req, res) => {
+  res.type("text/plain; charset=utf-8").send(
+    "Впишите в Roblox (OAuth App → Redirect URLs) ровно эту строку:\n\n" + redirectUri(req) + "\n"
+  );
 });
 
 app.get("/auth/callback", async (req, res) => {
@@ -125,7 +139,7 @@ app.get("/auth/callback", async (req, res) => {
         grant_type: "authorization_code",
         code: String(req.query.code),
         code_verifier: o.verifier,
-        redirect_uri: REDIRECT_URI,
+        redirect_uri: redirectUri(req),
       }),
     });
     const token = await tokenRes.json();
