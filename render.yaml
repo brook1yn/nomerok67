@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: hunt-numbers
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: ROBLOX_CLIENT_ID
+        sync: false
+      - key: ROBLOX_CLIENT_SECRET
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: GAME_URL
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: GAME_SECRET
+        generateValue: true

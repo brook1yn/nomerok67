@@ -1,0 +1,18 @@
+{
+  "name": "hunt-numbers-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The Hunt For Numbers — прокрутка номеров на сайте с выводом в игру",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cookie-session": "^2.1.0",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}
