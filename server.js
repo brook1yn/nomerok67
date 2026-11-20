@@ -77,6 +77,19 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS plates_user_idx ON plates (user_id, status);
     ALTER TABLE plates ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'roll';
+    CREATE TABLE IF NOT EXISTS cars (
+      id         BIGSERIAL PRIMARY KEY,
+      user_id    BIGINT NOT NULL,
+      car_id     TEXT NOT NULL,
+      car_name   TEXT NOT NULL,
+      paid       INT NOT NULL DEFAULT 0,
+      source     TEXT NOT NULL,
+      status     TEXT NOT NULL DEFAULT 'site', -- site | pending | delivering | delivered | failed
+      note       TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS cars_user_idx ON cars (user_id, status);
     CREATE INDEX IF NOT EXISTS plates_feed_idx ON plates (id DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS plates_norm_active
       ON plates (norm) WHERE status IN ('site','pending','delivering');
@@ -276,13 +289,60 @@ function plateOut(p) {
 }
 
 // ---------- Кейсы ----------
-// weights: шанс редкости 1..6 (в процентах). Окупаемость ~75% — как у прокрутки (~83%) чуть хуже, зато гарантия редкости.
+// weights: шанс редкости номера 1..6 (в процентах).
+// cars: машины из игры (только не донатные), chance — в процентах. Если машина не выпала — выпадает номер по weights.
+// id машины = атрибут CarId шаблона в ServerStorage.CarTemplates.
+const CARS = {
+  LadaPriora: { name: "Lada Priora", value: 500000, color: "rgb(70,160,255)", image: "/cars/priora.webp" },
+  "drift  car supra": { name: "Toyota Supra (дрифт)", value: 5000000, color: "rgb(176,110,255)", image: "/cars/supra.webp" },
+  BMWM5F90: { name: "BMW M5 F90", value: 15000000, color: "rgb(255,196,56)", image: "/cars/bmw-m5-f90.webp" },
+  Gelik: { name: "Mercedes-Benz G63", value: 20000000, color: "rgb(255,84,112)", image: "/cars/gelik.webp" },
+};
 const CASES = [
-  { id: "start", name: "Стартовый", price: 1000, color: "rgb(86,214,120)", weights: [0, 50, 30, 15, 4, 1, 0] },
-  { id: "rare", name: "Редкий", price: 6000, color: "rgb(70,160,255)", weights: [0, 0, 35, 40, 18, 6, 1] },
-  { id: "elite", name: "Элитный", price: 16000, color: "rgb(176,110,255)", weights: [0, 0, 0, 40, 35, 22, 3] },
-  { id: "myth", name: "Мифический", price: 45000, color: "rgb(255,84,112)", weights: [0, 0, 0, 0, 40, 50, 10] },
+  { id: "start", name: "Стартовый", price: 600, color: "rgb(86,214,120)", weights: [0, 60, 30, 8, 1.9, 0.1, 0] },
+  { id: "rare", name: "Редкий", price: 2000, color: "rgb(70,160,255)", weights: [0, 0, 40, 45, 14.88, 0.1, 0.02] },
+  { id: "elite", name: "Элитный", price: 4500, color: "rgb(176,110,255)", weights: [0, 0, 0, 30, 69.88, 0.1, 0.02] },
+  {
+    id: "auto", name: "Автокейс", price: 10000, color: "rgb(255,150,60)", kind: "cars", cover: ["LadaPriora", "drift  car supra"],
+    weights: [0, 0, 45, 45, 9.9, 0.1, 0],
+    cars: [
+      { id: "LadaPriora", chance: 0.5 },
+      { id: "drift  car supra", chance: 0.05 },
+      { id: "BMWM5F90", chance: 0.01 },
+      { id: "Gelik", chance: 0.005 },
+    ],
+  },
+  {
+    id: "garage", name: "Премиум-гараж", price: 50000, color: "rgb(255,84,112)", kind: "cars", cover: ["Gelik", "BMWM5F90"],
+    weights: [0, 0, 0, 50, 49.9, 0.1, 0],
+    cars: [
+      { id: "LadaPriora", chance: 2 },
+      { id: "drift  car supra", chance: 0.25 },
+      { id: "BMWM5F90", chance: 0.08 },
+      { id: "Gelik", chance: 0.03 },
+    ],
+  },
 ];
+for (const cs of CASES) {
+  for (const c of cs.cars || []) Object.assign(c, CARS[c.id]);
+  if (cs.cover) cs.coverImages = cs.cover.map((id) => CARS[id].image);
+}
+
+// машина из кейса: случайное число 0..100, идём по шансам машин
+function pickCar(cs) {
+  if (!cs.cars) return null;
+  let r = crypto.randomInt(0, 10000000) / 100000; // 0..100 с точностью 0.00001
+  if (process.env.DEV_LOGIN === "1" && process.env.DEV_CARS) r /= Number(process.env.DEV_CARS); // только локальная проверка
+  for (const c of cs.cars) {
+    r -= c.chance;
+    if (r < 0) return c;
+  }
+  return null;
+}
+function carOut(c) {
+  const def = CARS[c.car_id] || { color: "rgb(150,156,172)", value: 0 };
+  return { id: String(c.id), kind: "car", carId: c.car_id, name: c.car_name, color: def.color, value: def.value, image: def.image || null, status: c.status, note: c.note, source: c.source };
+}
 const UPGRADE_EDGE = 0.85; // шанс апгрейда = стоимость ставки / стоимость цели × 0.85
 const UPGRADE_MAX_CHANCE = 0.75;
 const UPGRADE_MAX_ITEMS = 6;
@@ -357,6 +417,7 @@ app.get("/api/live", async (req, res) => {
   if (!req.session.vid) req.session.vid = b64url(crypto.randomBytes(9));
   visitors.set(req.session.vid, Date.now());
   const since = Math.max(0, Number(req.query.since) || 0);
+  const sinceCar = Math.max(0, Number(req.query.sincec) || 0);
   // задержка 5 сек — чтобы лента не спойлерила результат, пока у игрока крутится анимация
   const rows = (
     await pool.query(
@@ -365,6 +426,15 @@ app.get("/api/live", async (req, res) => {
        WHERE p.id > $1 AND p.created_at < now() - interval '5 seconds'
        ORDER BY p.id DESC LIMIT 30`,
       [since]
+    )
+  ).rows;
+  const carRows = (
+    await pool.query(
+      `SELECT c.id, c.car_id, c.car_name, c.source, c.created_at, u.username, u.display_name, u.avatar
+       FROM cars c JOIN users u ON u.user_id = c.user_id
+       WHERE c.id > $1 AND c.created_at < now() - interval '6 seconds'
+       ORDER BY c.id DESC LIMIT 10`,
+      [sinceCar]
     )
   ).rows;
   res.json({
@@ -379,6 +449,19 @@ app.get("/api/live", async (req, res) => {
       source: r.source,
       user: r.display_name || r.username || "Игрок",
       avatar: r.avatar,
+      t: new Date(r.created_at).getTime(),
+    })),
+    cars: carRows.map((r) => ({
+      id: Number(r.id),
+      kind: "car",
+      carId: r.car_id,
+      name: r.car_name,
+      color: (CARS[r.car_id] || {}).color || "rgb(255,196,56)",
+      image: (CARS[r.car_id] || {}).image || null,
+      source: r.source,
+      user: r.display_name || r.username || "Игрок",
+      avatar: r.avatar,
+      t: new Date(r.created_at).getTime(),
     })),
   });
 });
@@ -461,7 +544,20 @@ app.get("/api/plates", auth, async (req, res) => {
      ORDER BY updated_at DESC LIMIT 30`,
     [req.uid]
   );
-  res.json({ plates: active.rows.map(plateOut), history: history.rows.map(plateOut) });
+  const carsActive = await pool.query(
+    `SELECT * FROM cars WHERE user_id=$1 AND status IN ('site','pending','delivering') ORDER BY id DESC`,
+    [req.uid]
+  );
+  const carsHistory = await pool.query(
+    `SELECT * FROM cars WHERE user_id=$1 AND status IN ('delivered','failed') ORDER BY updated_at DESC LIMIT 15`,
+    [req.uid]
+  );
+  res.json({
+    plates: active.rows.map(plateOut),
+    history: history.rows.map(plateOut),
+    cars: carsActive.rows.map(carOut),
+    carHistory: carsHistory.rows.map(carOut),
+  });
 });
 
 async function changePlate(req, res, from, to) {
@@ -472,6 +568,17 @@ async function changePlate(req, res, from, to) {
   if (!r.rows[0]) return res.status(409).json({ error: "Номер уже недоступен для этого действия" });
   res.json({ plate: plateOut(r.rows[0]) });
 }
+
+async function changeCar(req, res, from, to) {
+  const r = await pool.query(
+    `UPDATE cars SET status=$1, updated_at=now() WHERE id=$2 AND user_id=$3 AND status=$4 RETURNING *`,
+    [to, req.params.id, req.uid, from]
+  );
+  if (!r.rows[0]) return res.status(409).json({ error: "Машина уже недоступна для этого действия" });
+  res.json({ car: carOut(r.rows[0]) });
+}
+app.post("/api/cars/:id/withdraw", auth, (req, res) => changeCar(req, res, "site", "pending"));
+app.post("/api/cars/:id/cancel", auth, (req, res) => changeCar(req, res, "pending", "site"));
 
 app.post("/api/plates/:id/withdraw", auth, (req, res) => changePlate(req, res, "site", "pending"));
 app.post("/api/plates/:id/cancel", auth, (req, res) => changePlate(req, res, "pending", "site"));
@@ -513,6 +620,21 @@ app.post("/api/case/:id/open", auth, (req, res) => {
     if (!user) throw httpErr(401, "Нет пользователя");
     if (available === null) throw httpErr(409, "Зайдите в игру хотя бы раз — так сайт узнает ваш баланс рублей");
     if (available < cs.price) throw httpErr(402, "Недостаточно рублей! Кейс стоит " + cs.price + " ₽");
+    const car = pickCar(cs);
+    if (car) {
+      const c = (
+        await client.query(
+          `INSERT INTO cars (user_id, car_id, car_name, paid, source) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+          [req.uid, car.id, car.name, cs.price, "case:" + cs.id]
+        )
+      ).rows[0];
+      await client.query(`INSERT INTO charges (user_id, amount, reason) VALUES ($1,$2,$3)`, [
+        req.uid,
+        cs.price,
+        "case:" + cs.id + ":car" + c.id,
+      ]);
+      return { car: carOut(c), balance: available - cs.price };
+    }
     const tier = pickTier(cs.weights);
     const row = await insertPlateOfTier(client, req.uid, tier, "case:" + cs.id);
     if (!row) throw httpErr(503, "Не удалось подобрать номер, попробуйте ещё раз");
@@ -645,7 +767,25 @@ app.post("/api/game/sync", gameAuth, async (req, res) => {
         sellPrice: p.sell_price,
       }));
     }
-    res.json({ charges, plates });
+    let cars = [];
+    if (ids.length) {
+      cars = (
+        await client.query(
+          `UPDATE cars SET status='delivering', updated_at=now()
+           WHERE user_id = ANY($1::bigint[])
+             AND (status='pending' OR (status='delivering' AND updated_at < now() - ($2 || ' seconds')::interval))
+           RETURNING *`,
+          [ids, String(REDELIVER_SEC)]
+        )
+      ).rows.map((c) => ({
+        id: Number(c.id),
+        userId: Number(c.user_id),
+        carId: c.car_id,
+        name: c.car_name,
+        value: (CARS[c.car_id] || {}).value || 0,
+      }));
+    }
+    res.json({ charges, plates, cars });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "db" });
@@ -657,8 +797,30 @@ app.post("/api/game/sync", gameAuth, async (req, res) => {
 // Ответ игры по выданным номерам: body { results: [{id, ok, reason}] }
 app.post("/api/game/plates-ack", gameAuth, async (req, res) => {
   const results = Array.isArray(req.body.results) ? req.body.results.slice(0, 500) : [];
+  const carResults = Array.isArray(req.body.cars) ? req.body.cars.slice(0, 200) : [];
   const client = await pool.connect();
   try {
+    for (const r of carResults) {
+      await client.query("BEGIN");
+      if (r.ok) {
+        await client.query(
+          `UPDATE cars SET status='delivered', note=$2, updated_at=now() WHERE id=$1 AND status='delivering'`,
+          [r.id, r.dup ? "Уже была — выдана повторка" : null]
+        );
+      } else {
+        // машину выдать нельзя (её нет в игре) — возвращаем цену кейса
+        const c = (
+          await client.query(
+            `UPDATE cars SET status='failed', note=$2, updated_at=now() WHERE id=$1 AND status='delivering' RETURNING *`,
+            [r.id, String(r.reason || "Не удалось выдать машину").slice(0, 200)]
+          )
+        ).rows[0];
+        if (c && c.paid > 0) {
+          await client.query(`INSERT INTO charges (user_id, amount, reason) VALUES ($1,$2,$3)`, [c.user_id, -c.paid, "refundcar:" + c.id]);
+        }
+      }
+      await client.query("COMMIT");
+    }
     for (const r of results) {
       await client.query("BEGIN");
       if (r.ok) {
