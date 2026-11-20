@@ -76,6 +76,8 @@ async function initDb() {
       updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS plates_user_idx ON plates (user_id, status);
+    ALTER TABLE plates ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'roll';
+    CREATE INDEX IF NOT EXISTS plates_feed_idx ON plates (id DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS plates_norm_active
       ON plates (norm) WHERE status IN ('site','pending','delivering');
   `);
@@ -96,6 +98,24 @@ app.use(
 );
 
 // ---------- Вход через Roblox ----------
+// Права приложения: по умолчанию "openid profile". Их нужно отметить в настройках OAuth-приложения Roblox.
+const OAUTH_SCOPES = String(process.env.ROBLOX_SCOPES || "openid profile").trim();
+
+async function robloxPublicProfile(uid) {
+  const out = { username: null, displayName: null, avatar: null };
+  try {
+    const u = await (await fetch("https://users.roblox.com/v1/users/" + uid)).json();
+    out.username = u.name || null;
+    out.displayName = u.displayName || null;
+  } catch {}
+  try {
+    const t = await (
+      await fetch("https://thumbnails.roblox.com/v1/users/avatar-headshot?size=150x150&format=Png&userIds=" + uid)
+    ).json();
+    out.avatar = (t.data && t.data[0] && t.data[0].imageUrl) || null;
+  } catch {}
+  return out;
+}
 const b64url = (buf) => buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 app.get("/auth/login", (req, res) => {
@@ -107,7 +127,7 @@ app.get("/auth/login", (req, res) => {
   const q = new URLSearchParams({
     client_id: ROBLOX_CLIENT_ID,
     redirect_uri: redirectUri(req),
-    scope: "openid profile",
+    scope: OAUTH_SCOPES,
     response_type: "code",
     state,
     code_challenge: challenge,
@@ -126,6 +146,10 @@ app.get("/auth/where", (req, res) => {
 app.get("/auth/callback", async (req, res) => {
   try {
     const o = req.session.oauth;
+    if (req.query.error) {
+      console.error("oauth error", req.query.error, req.query.error_description);
+      return res.redirect("/?error=" + encodeURIComponent(String(req.query.error)));
+    }
     if (!o || !req.query.code || req.query.state !== o.state) {
       return res.redirect("/?error=state");
     }
@@ -147,15 +171,44 @@ app.get("/auth/callback", async (req, res) => {
       console.error("token error", token);
       return res.redirect("/?error=token");
     }
-    const infoRes = await fetch("https://apis.roblox.com/oauth/v1/userinfo", {
-      headers: { Authorization: "Bearer " + token.access_token },
-    });
-    const info = await infoRes.json();
-    if (!info.sub) return res.redirect("/?error=userinfo");
+    // кто вошёл: userinfo (нужен openid), запасной путь — introspect токена
+    let info = {};
+    try {
+      const infoRes = await fetch("https://apis.roblox.com/oauth/v1/userinfo", {
+        headers: { Authorization: "Bearer " + token.access_token },
+      });
+      info = await infoRes.json();
+    } catch {}
+    if (!info.sub) {
+      const intr = await (
+        await fetch("https://apis.roblox.com/oauth/v1/token/introspect", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            token: token.access_token,
+            client_id: ROBLOX_CLIENT_ID,
+            client_secret: ROBLOX_CLIENT_SECRET || "",
+          }),
+        })
+      ).json();
+      if (!intr.sub) {
+        console.error("no sub", info, intr);
+        return res.redirect("/?error=userinfo");
+      }
+      info = { sub: intr.sub };
+    }
+    if (!/^\d+$/.test(String(info.sub))) return res.redirect("/?error=userinfo");
+    if (!info.preferred_username || !info.picture) {
+      const pub = await robloxPublicProfile(info.sub);
+      info.preferred_username = info.preferred_username || pub.username;
+      info.name = info.name || pub.displayName;
+      info.picture = info.picture || pub.avatar;
+    }
     await pool.query(
       `INSERT INTO users (user_id, username, display_name, avatar) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (user_id) DO UPDATE SET username=$2, display_name=$3, avatar=COALESCE($4, users.avatar)`,
-      [info.sub, info.preferred_username || null, info.name || info.nickname || null, info.picture || null]
+       ON CONFLICT (user_id) DO UPDATE SET username=COALESCE($2, users.username),
+         display_name=COALESCE($3, users.display_name), avatar=COALESCE($4, users.avatar)`,
+      [String(info.sub), info.preferred_username || null, info.name || info.nickname || null, info.picture || null]
     );
     req.session.uid = String(info.sub);
     res.redirect("/");
@@ -216,13 +269,118 @@ function plateOut(p) {
     color: r.color,
     sellPrice: p.sell_price,
     status: p.status,
+    source: p.source,
     note: p.note,
     createdAt: p.created_at,
   };
 }
 
+// ---------- Кейсы ----------
+// weights: шанс редкости 1..6 (в процентах). Окупаемость ~75% — как у прокрутки (~83%) чуть хуже, зато гарантия редкости.
+const CASES = [
+  { id: "start", name: "Стартовый", price: 1000, color: "rgb(86,214,120)", weights: [0, 50, 30, 15, 4, 1, 0] },
+  { id: "rare", name: "Редкий", price: 6000, color: "rgb(70,160,255)", weights: [0, 0, 35, 40, 18, 6, 1] },
+  { id: "elite", name: "Элитный", price: 16000, color: "rgb(176,110,255)", weights: [0, 0, 0, 40, 35, 22, 3] },
+  { id: "myth", name: "Мифический", price: 45000, color: "rgb(255,84,112)", weights: [0, 0, 0, 0, 40, 50, 10] },
+];
+const UPGRADE_EDGE = 0.85; // шанс апгрейда = стоимость ставки / стоимость цели × 0.85
+const UPGRADE_MAX_CHANCE = 0.75;
+const UPGRADE_MAX_ITEMS = 6;
+
+function pickTier(weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = (crypto.randomInt(0, 1000000) / 1000000) * total;
+  for (let t = 1; t < weights.length; t++) {
+    r -= weights[t];
+    if (r < 0) return t;
+  }
+  return weights.length - 1;
+}
+
+// Вставить новый номер нужной редкости (уникальный среди активных номеров сайта)
+async function insertPlateOfTier(client, uid, tier, source) {
+  for (let i = 0; i < 8; i++) {
+    const g = P.generateWithTier(tier);
+    if (!g) continue;
+    const r = await client.query(
+      `INSERT INTO plates (user_id, country, plate, norm, tier, sell_price, source) VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT DO NOTHING RETURNING *`,
+      [uid, g.country, g.plate, P.normalizePlate(g.plate), tier, P.getSellPrice(tier), source]
+    );
+    if (r.rows[0]) return r.rows[0];
+  }
+  return null;
+}
+
+function httpErr(status, message) {
+  return Object.assign(new Error(message), { status });
+}
+
+async function withTx(res, fn) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await fn(client);
+    await client.query("COMMIT");
+    res.json(out);
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : "Ошибка сервера" });
+  } finally {
+    client.release();
+  }
+}
+
 app.get("/api/config", (req, res) => {
-  res.json({ rollCost: ROLL_COST, countries: P.COUNTRIES, sellRanges: P.SELL_RANGES, gameUrl: GAME_URL });
+  res.json({
+    rollCost: ROLL_COST,
+    countries: P.COUNTRIES,
+    sellRanges: P.SELL_RANGES,
+    sellMid: P.SELL_MID,
+    rarities: P.RARITIES,
+    gameUrl: GAME_URL,
+    cases: CASES,
+    upgrade: { edge: UPGRADE_EDGE, maxChance: UPGRADE_MAX_CHANCE, maxItems: UPGRADE_MAX_ITEMS },
+  });
+});
+
+// ---------- Онлайн и лента ----------
+const visitors = new Map(); // id посетителя -> время последнего запроса
+const ONLINE_SITE_SEC = 30;
+setInterval(() => {
+  const cut = Date.now() - ONLINE_SITE_SEC * 1000;
+  for (const [k, t] of visitors) if (t < cut) visitors.delete(k);
+}, 15000).unref();
+
+app.get("/api/live", async (req, res) => {
+  if (!req.session.vid) req.session.vid = b64url(crypto.randomBytes(9));
+  visitors.set(req.session.vid, Date.now());
+  const since = Math.max(0, Number(req.query.since) || 0);
+  // задержка 5 сек — чтобы лента не спойлерила результат, пока у игрока крутится анимация
+  const rows = (
+    await pool.query(
+      `SELECT p.id, p.country, p.plate, p.tier, p.source, p.created_at, u.username, u.display_name, u.avatar
+       FROM plates p JOIN users u ON u.user_id = p.user_id
+       WHERE p.id > $1 AND p.created_at < now() - interval '5 seconds'
+       ORDER BY p.id DESC LIMIT 30`,
+      [since]
+    )
+  ).rows;
+  res.json({
+    online: visitors.size,
+    feed: rows.map((r) => ({
+      id: Number(r.id),
+      country: r.country,
+      plate: r.plate,
+      tier: r.tier,
+      rarity: P.RARITIES[r.tier].name,
+      color: P.RARITIES[r.tier].color,
+      source: r.source,
+      user: r.display_name || r.username || "Игрок",
+      avatar: r.avatar,
+    })),
+  });
 });
 
 app.get("/api/me", async (req, res) => {
@@ -299,7 +457,7 @@ app.get("/api/plates", auth, async (req, res) => {
     [req.uid]
   );
   const history = await pool.query(
-    `SELECT * FROM plates WHERE user_id=$1 AND status IN ('delivered','failed','sold')
+    `SELECT * FROM plates WHERE user_id=$1 AND status IN ('delivered','failed','sold','upgraded')
      ORDER BY updated_at DESC LIMIT 30`,
     [req.uid]
   );
@@ -342,6 +500,83 @@ app.post("/api/plates/:id/sell", auth, async (req, res) => {
   } finally {
     client.release();
   }
+});
+
+app.post("/api/case/:id/open", auth, (req, res) => {
+  const cs = CASES.find((c) => c.id === req.params.id);
+  if (!cs) return res.status(404).json({ error: "Нет такого кейса" });
+  const now = Date.now();
+  if (now - (lastRollAt.get(req.uid) || 0) < 700) return res.status(429).json({ error: "Слишком быстро" });
+  lastRollAt.set(req.uid, now);
+  withTx(res, async (client) => {
+    const { user, available } = await availableFor(client, req.uid, true);
+    if (!user) throw httpErr(401, "Нет пользователя");
+    if (available === null) throw httpErr(409, "Зайдите в игру хотя бы раз — так сайт узнает ваш баланс рублей");
+    if (available < cs.price) throw httpErr(402, "Недостаточно рублей! Кейс стоит " + cs.price + " ₽");
+    const tier = pickTier(cs.weights);
+    const row = await insertPlateOfTier(client, req.uid, tier, "case:" + cs.id);
+    if (!row) throw httpErr(503, "Не удалось подобрать номер, попробуйте ещё раз");
+    await client.query(`INSERT INTO charges (user_id, amount, reason) VALUES ($1,$2,$3)`, [
+      req.uid,
+      cs.price,
+      "case:" + cs.id + ":" + row.id,
+    ]);
+    return { plate: plateOut(row), balance: available - cs.price };
+  });
+});
+
+// Апгрейд: ставим 1–6 своих номеров, выбираем редкость-цель. Победа — новый номер этой редкости,
+// проигрыш — номера сгорают. Шанс = сумма цен / средняя цена цели × 0.85 (максимум 75%).
+app.post("/api/upgrade", auth, (req, res) => {
+  const ids = [...new Set((Array.isArray(req.body.plateIds) ? req.body.plateIds : []).map(String))].filter((x) => /^\d+$/.test(x));
+  const target = Math.floor(Number(req.body.targetTier));
+  if (!ids.length || ids.length > UPGRADE_MAX_ITEMS) return res.status(400).json({ error: "Выберите от 1 до " + UPGRADE_MAX_ITEMS + " номеров" });
+  if (!(target >= 2 && target <= 6)) return res.status(400).json({ error: "Выберите редкость" });
+  const now = Date.now();
+  if (now - (lastRollAt.get(req.uid) || 0) < 700) return res.status(429).json({ error: "Слишком быстро" });
+  lastRollAt.set(req.uid, now);
+  withTx(res, async (client) => {
+    const rows = (
+      await client.query(`SELECT * FROM plates WHERE id = ANY($1::bigint[]) AND user_id=$2 AND status='site' FOR UPDATE`, [ids, req.uid])
+    ).rows;
+    if (rows.length !== ids.length) throw httpErr(409, "Некоторые номера уже недоступны");
+    const stake = rows.reduce((a, p) => a + p.sell_price, 0);
+    const goal = P.SELL_MID[target];
+    if (stake >= goal) throw httpErr(400, "Ставка дороже цели — выберите редкость выше");
+    if (rows.some((p) => p.tier >= target)) throw httpErr(400, "Номер-ставка не может быть той же или выше редкости, что цель");
+    const chance = Math.min(UPGRADE_MAX_CHANCE, (stake / goal) * UPGRADE_EDGE);
+    const roll = crypto.randomInt(0, 1000000) / 1000000;
+    const win = roll < chance;
+    await client.query(
+      `UPDATE plates SET status='upgraded', note=$2, updated_at=now() WHERE id = ANY($1::bigint[])`,
+      [ids, win ? "Апгрейд: успех" : "Апгрейд: сгорел"]
+    );
+    let plate = null;
+    if (win) {
+      const row = await insertPlateOfTier(client, req.uid, target, "upgrade");
+      if (!row) throw httpErr(503, "Не удалось подобрать номер, попробуйте ещё раз");
+      plate = plateOut(row);
+    }
+    return { win, chance, roll, plate };
+  });
+});
+
+// Продать все номера на сайте (до выбранной редкости включительно)
+app.post("/api/plates/sell-all", auth, (req, res) => {
+  const maxTier = Math.min(6, Math.max(1, Math.floor(Number(req.body.maxTier) || 6)));
+  withTx(res, async (client) => {
+    const rows = (
+      await client.query(
+        `UPDATE plates SET status='sold', updated_at=now() WHERE user_id=$1 AND status='site' AND tier <= $2 RETURNING *`,
+        [req.uid, maxTier]
+      )
+    ).rows;
+    if (!rows.length) throw httpErr(409, "Нечего продавать");
+    const sum = rows.reduce((a, p) => a + p.sell_price, 0);
+    await client.query(`INSERT INTO charges (user_id, amount, reason) VALUES ($1,$2,$3)`, [req.uid, -sum, "sellall:" + rows.length]);
+    const { available } = await availableFor(client, req.uid, false);
+    return { count: rows.length, sum, balance: available };
+  });
 });
 
 // ---------- API для игровых серверов ----------
@@ -460,6 +695,14 @@ app.post("/api/game/plates-ack", gameAuth, async (req, res) => {
 });
 
 app.get("/healthz", (req, res) => res.send("ok"));
+
+// та же генерация/редкость, что на сервере, — для анимаций в браузере
+const fs = require("fs");
+const platesClientJs = fs
+  .readFileSync(path.join(__dirname, "plates.js"), "utf8")
+  .replace('const crypto = require("crypto");', "const crypto = { randomInt: (a, b) => a + Math.floor(Math.random() * (b - a)) };")
+  .replace("module.exports =", "window.Plates =");
+app.get("/js/plates.js", (req, res) => res.type("application/javascript").send("(function(){" + platesClientJs + "})();"));
 app.use(express.static(path.join(__dirname, "public"), { maxAge: "5m" }));
 
 initDb()

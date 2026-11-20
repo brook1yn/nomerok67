@@ -129,9 +129,25 @@ function getSellPrice(tier) {
   return (Math.floor(a / 10) + rnd(Math.floor(b / 10) - Math.floor(a / 10) + 1)) * 10;
 }
 
+// средняя цена редкости (как PlateRenderer.SELL_PRICES в игре)
+const SELL_MID = SELL_RANGES.map((r) => (r ? Math.floor((r[0] + r[1]) / 2) : 0));
+
+// Номер нужной редкости: перебираем случайные номера, пока не выпадет нужная.
+// Если в одной стране долго не выходит — пробуем другие.
+function generateWithTier(tier, preferCountry) {
+  const order = preferCountry ? [preferCountry, ...COUNTRIES.filter((c) => c !== preferCountry)] : [...COUNTRIES].sort(() => Math.random() - 0.5);
+  for (const country of order) {
+    for (let i = 0; i < 250000; i++) {
+      const plate = generatePlate(country);
+      if (getRarity(country, plate).tier === tier) return { country, plate };
+    }
+  }
+  return null;
+}
+
 // как normalizePlate в игре: без пробелов, в верхнем регистре
 function normalizePlate(plate) {
   return plate.replace(/\s+/g, "").toUpperCase();
 }
 
-module.exports = { COUNTRIES, RARITIES, SELL_RANGES, generatePlate, getRarity, getSellPrice, normalizePlate };
+module.exports = { COUNTRIES, RARITIES, SELL_RANGES, SELL_MID, generateWithTier, generatePlate, getRarity, getSellPrice, normalizePlate };
